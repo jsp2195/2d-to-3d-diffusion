@@ -1,5 +1,6 @@
 import glob
 import os
+import random
 from typing import List, Tuple
 
 import nibabel as nib
@@ -8,81 +9,108 @@ import torch
 from torch.utils.data import Dataset
 
 
+torch.manual_seed(42)
+np.random.seed(42)
+
+
 class BraTSDataset(Dataset):
-    def __init__(self, root_dir: str):
+    def __init__(self, root_dir: str, split: str = "train", k_slices: int = 5, seed: int = 42):
+        if split not in {"train", "val"}:
+            raise ValueError("split must be 'train' or 'val'")
+        if k_slices % 2 == 0:
+            raise ValueError("k_slices must be odd")
+
         self.root_dir = root_dir
+        self.split = split
+        self.k_slices = k_slices
+        self.seed = seed
+        self.crop_size = 128
+
+        self.paths = self._collect_t1_paths(root_dir)
+        if len(self.paths) == 0:
+            raise RuntimeError(f"No T1 files found under {root_dir}")
+
+        rng = random.Random(seed)
+        shuffled = self.paths.copy()
+        rng.shuffle(shuffled)
+        n_train = int(0.8 * len(shuffled))
+        self.split_paths = shuffled[:n_train] if split == "train" else shuffled[n_train:]
+
+    @staticmethod
+    def _collect_t1_paths(root_dir: str) -> List[str]:
         pattern = os.path.join(
             root_dir,
+            "BraTS2020_TrainingData",
             "MICCAI_BraTS2020_TrainingData",
             "BraTS20_Training_*",
             "*_t1.nii*",
         )
-        self.t1_files: List[str] = sorted(glob.glob(pattern))
-        if len(self.t1_files) == 0:
-            raise FileNotFoundError(f"No T1 files found with pattern: {pattern}")
+        candidates = sorted(glob.glob(pattern))
+        t1_paths = []
+        for p in candidates:
+            lower = p.lower()
+            if lower.endswith("_t1.nii") or lower.endswith("_t1.nii.gz"):
+                t1_paths.append(p)
+        return t1_paths
 
     def __len__(self) -> int:
-        return len(self.t1_files)
+        return len(self.split_paths)
 
-    @staticmethod
-    def _center_crop_3d(volume: np.ndarray, out_size: Tuple[int, int, int] = (128, 128, 128)) -> np.ndarray:
-        # volume shape: [D, H, W]
-        d, h, w = volume.shape
-        out_d, out_h, out_w = out_size
-        if d < out_d or h < out_h or w < out_w:
-            raise ValueError(f"Input volume shape {volume.shape} is smaller than crop size {out_size}.")
-        d0 = (d - out_d) // 2
-        h0 = (h - out_h) // 2
-        w0 = (w - out_w) // 2
+    def _center_crop_3d(self, vol: np.ndarray) -> np.ndarray:
+        # vol shape: [D, H, W]
+        d, h, w = vol.shape
+        c = self.crop_size
+        if d < c or h < c or w < c:
+            raise ValueError(f"Volume too small for 128^3 crop: got {vol.shape}")
+
+        d_start = (d - c) // 2
+        d_end = d_start + c
+        h_start = (h - c) // 2
+        h_end = h_start + c
+        w_start = (w - c) // 2
+        w_end = w_start + c
+
         # cropped shape: [128, 128, 128]
-        cropped = volume[d0:d0 + out_d, h0:h0 + out_h, w0:w0 + out_w]
-        return cropped
+        return vol[d_start:d_end, h_start:h_end, w_start:w_end]
 
     @staticmethod
-    def _zscore_normalize(volume: np.ndarray) -> np.ndarray:
-        # volume shape: [D, H, W]
-        mean = float(volume.mean())
-        std = float(volume.std())
-        if std < 1e-6:
-            std = 1.0
-        # normalized shape: [D, H, W]
-        normalized = (volume - mean) / std
-        return normalized
+    def _normalize(vol: np.ndarray) -> np.ndarray:
+        # vol shape: [D, H, W]
+        p_low = np.percentile(vol, 0.5)
+        p_high = np.percentile(vol, 99.5)
+        vol = np.clip(vol, p_low, p_high)
+        mean = vol.mean(dtype=np.float32)
+        std = vol.std(dtype=np.float32)
+        vol = (vol - mean) / (std + 1e-6)
+        return vol.astype(np.float32)
 
-    def __getitem__(self, index: int):
-        t1_path = self.t1_files[index]
-        nii = nib.load(t1_path)
-        vol = nii.get_fdata(dtype=np.float32)
-        # raw vol shape: [H, W, D]
+    def __getitem__(self, idx: int) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        path = self.split_paths[idx]
+
+        img = nib.load(path)
+        img = nib.as_closest_canonical(img)
+        vol = img.get_fdata().astype(np.float32)
+        # vol shape from nib: [H, W, D]
         vol = np.transpose(vol, (2, 0, 1))
-        # reordered vol shape: [D, H, W]
-        vol = self._center_crop_3d(vol, (128, 128, 128))
-        # cropped vol shape: [D=128, H=128, W=128]
-        vol = self._zscore_normalize(vol).astype(np.float32)
-        # normalized vol shape: [D=128, H=128, W=128]
+        # vol shape after transpose: [D, H, W]
 
-        d = vol.shape[0]
-        center_idx = d // 2
-        cond2d = vol[center_idx]
-        # cond2d shape: [H=128, W=128]
-        target3d = vol
-        # target3d shape: [D=128, H=128, W=128]
+        vol = self._center_crop_3d(vol)
+        # vol shape: [128, 128, 128]
+        vol = self._normalize(vol)
+        # vol shape: [128, 128, 128]
 
-        cond2d_t = torch.from_numpy(cond2d).unsqueeze(0).float()
-        # cond2d_t shape: [C=1, H=128, W=128]
-        target3d_t = torch.from_numpy(target3d).unsqueeze(0).float()
-        # target3d_t shape: [C=1, D=128, H=128, W=128]
+        d, h, w = vol.shape
+        z0 = d // 2
+        half = self.k_slices // 2
+        indices = list(range(z0 - half, z0 + half + 1))
 
-        return cond2d_t, target3d_t
+        cond2d_np = np.stack([vol[z] for z in indices], axis=0)
+        # cond2d_np shape: [K, H, W]
+        target3d_np = vol[np.newaxis, ...]
+        # target3d_np shape: [1, D, H, W]
 
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--root_dir", type=str, required=True)
-    args = parser.parse_args()
-
-    ds = BraTSDataset(args.root_dir)
-    c, t = ds[0]
-    print(c.shape, t.shape)
+        cond2d = torch.from_numpy(cond2d_np).float()
+        # cond2d shape: [K, H, W]
+        target3d = torch.from_numpy(target3d_np).float()
+        # target3d shape: [1, D, H, W]
+        return cond2d, target3d
