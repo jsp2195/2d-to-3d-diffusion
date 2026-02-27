@@ -1,6 +1,23 @@
+import math
+from typing import List, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+
+class WSConv3d(nn.Conv3d):
+    def forward(self, x):
+        w = self.weight
+        w = w - w.mean(dim=(1, 2, 3, 4), keepdim=True)
+        w = w / (w.std(dim=(1, 2, 3, 4), keepdim=True) + 1e-5)
+        return F.conv3d(x, w, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -9,191 +26,251 @@ class SinusoidalTimeEmbedding(nn.Module):
         self.dim = dim
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        # t shape: [B]
         half = self.dim // 2
-        emb_scale = torch.log(torch.tensor(10000.0, device=t.device)) / (half - 1)
-        emb = torch.exp(torch.arange(half, device=t.device, dtype=torch.float32) * -emb_scale)
-        emb = t.float().unsqueeze(1) * emb.unsqueeze(0)
-        # emb shape: [B, dim/2]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-        # emb shape: [B, dim]
+        freqs = torch.exp(
+            torch.arange(half, device=t.device, dtype=torch.float32)
+            * (-math.log(10000.0) / max(half - 1, 1))
+        )
+        args = t.float().unsqueeze(1) * freqs.unsqueeze(0)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=1)
+        if emb.shape[1] < self.dim:
+            emb = F.pad(emb, (0, self.dim - emb.shape[1]))
         return emb
 
 
 class ResBlock3D(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, time_dim: int, groups: int = 8):
         super().__init__()
-        self.conv1 = nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1)
-        self.gn1 = nn.GroupNorm(groups, out_ch)
-        self.conv2 = nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1)
-        self.gn2 = nn.GroupNorm(groups, out_ch)
-        self.time_proj = nn.Linear(time_dim, out_ch)
-        self.skip = nn.Conv3d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
-        self.act = nn.SiLU()
+        self.norm1 = nn.GroupNorm(groups, in_ch)
+        self.act1 = nn.SiLU()
+        self.conv1 = WSConv3d(in_ch, out_ch, kernel_size=3, padding=1)
+
+        self.norm2 = nn.GroupNorm(groups, out_ch)
+        self.act2 = nn.SiLU()
+        self.conv2 = WSConv3d(out_ch, out_ch, kernel_size=3, padding=1)
+
+        self.time_mlp = nn.Linear(time_dim, out_ch * 2)
+        self.skip = WSConv3d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        # x shape: [B, C_in, D, H, W]
-        # t_emb shape: [B, time_dim]
-        h = self.conv1(x)
-        # h shape: [B, C_out, D, H, W]
-        h = self.gn1(h)
-        h = self.act(h)
-
-        t = self.time_proj(t_emb).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        # t shape: [B, C_out, 1, 1, 1]
-        h = h + t
-        # h shape: [B, C_out, D, H, W]
-
-        h = self.conv2(h)
-        # h shape: [B, C_out, D, H, W]
-        h = self.gn2(h)
-        h = self.act(h)
-
-        out = h + self.skip(x)
-        # out shape: [B, C_out, D, H, W]
-        return out
+        h = self.conv1(self.act1(self.norm1(x)))
+        gamma_beta = self.time_mlp(t_emb)
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        h = self.norm2(h)
+        h = h * (1 + gamma) + beta
+        h = self.conv2(self.act2(h))
+        return h + self.skip(x)
 
 
-class DownBlock3D(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, time_dim: int):
+class SelfAttention3D(nn.Module):
+    def __init__(self, channels: int, heads: int = 8, dim_head: int = 32):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        inner = heads * dim_head
+        self.norm = nn.GroupNorm(8, channels)
+        self.to_qkv = nn.Conv1d(channels, inner * 3, kernel_size=1)
+        self.to_out = nn.Conv1d(inner, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, d, h, w = x.shape
+        n = d * h * w
+        h_in = x
+        x = self.norm(x).view(b, c, n)
+        qkv = self.to_qkv(x)
+        q, k, v = qkv.chunk(3, dim=1)
+
+        q = q.view(b, self.heads, self.dim_head, n).permute(0, 1, 3, 2)
+        k = k.view(b, self.heads, self.dim_head, n)
+        v = v.view(b, self.heads, self.dim_head, n).permute(0, 1, 3, 2)
+
+        scale = self.dim_head ** -0.5
+        attn = torch.matmul(q, k) * scale
+        attn = attn.softmax(dim=-1)
+
+        out = torch.matmul(attn, v)
+        out = out.permute(0, 1, 3, 2).contiguous().view(b, self.heads * self.dim_head, n)
+        out = self.to_out(out).view(b, c, d, h, w)
+        return out + h_in
+
+
+class CrossAttention3D(nn.Module):
+    def __init__(self, channels: int, context_dim: int, heads: int = 8, dim_head: int = 32):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        inner = heads * dim_head
+        self.norm = nn.GroupNorm(8, channels)
+        self.to_q = nn.Conv1d(channels, inner, kernel_size=1)
+        self.to_k = nn.Linear(context_dim, inner)
+        self.to_v = nn.Linear(context_dim, inner)
+        self.to_out = nn.Conv1d(inner, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        b, c, d, h, w = x.shape
+        n = d * h * w
+        x_in = x
+        x = self.norm(x).view(b, c, n)
+        q = self.to_q(x).view(b, self.heads, self.dim_head, n).permute(0, 1, 3, 2)
+
+        k = self.to_k(context).view(b, -1, self.heads, self.dim_head).permute(0, 2, 3, 1)
+        v = self.to_v(context).view(b, -1, self.heads, self.dim_head).permute(0, 2, 1, 3)
+
+        scale = self.dim_head ** -0.5
+        attn = torch.matmul(q, k) * scale
+        attn = attn.softmax(dim=-1)
+
+        out = torch.matmul(attn, v)
+        out = out.permute(0, 1, 3, 2).contiguous().view(b, self.heads * self.dim_head, n)
+        out = self.to_out(out).view(b, c, d, h, w)
+        return out + x_in
+
+
+class CondEncoder2DTokens(nn.Module):
+    def __init__(self, in_channels: int, token_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.SiLU(),
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+            nn.Conv2d(256, token_dim, 4, stride=2, padding=1),
+            nn.GroupNorm(8, token_dim),
+            nn.SiLU(),
+        )
+
+    def forward(self, cond2d: torch.Tensor) -> torch.Tensor:
+        # cond2d: [B, K, H, W]
+        feat = self.net(cond2d)
+        # feat: [B, Cctx, H/8, W/8]
+        b, c, h, w = feat.shape
+        tokens = feat.flatten(2).transpose(1, 2)
+        # tokens: [B, Ntokens, Cctx]
+        return tokens
+
+
+class DownStage(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, time_dim: int, with_attn: bool):
         super().__init__()
         self.res1 = ResBlock3D(in_ch, out_ch, time_dim)
         self.res2 = ResBlock3D(out_ch, out_ch, time_dim)
-        self.down = nn.Conv3d(out_ch, out_ch, kernel_size=4, stride=2, padding=1)
+        self.attn = SelfAttention3D(out_ch) if with_attn else nn.Identity()
+        self.down = WSConv3d(out_ch, out_ch, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1))
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor):
-        # x shape: [B, C_in, D, H, W]
+    def forward(self, x, t_emb):
         x = self.res1(x, t_emb)
-        # x shape: [B, C_out, D, H, W]
         x = self.res2(x, t_emb)
-        # x shape: [B, C_out, D, H, W]
+        x = self.attn(x)
         skip = x
-        # skip shape: [B, C_out, D, H, W]
         x = self.down(x)
-        # x shape: [B, C_out, D/2, H/2, W/2]
         return x, skip
 
 
-class UpBlock3D(nn.Module):
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, time_dim: int):
+class UpStage(nn.Module):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, time_dim: int, with_attn: bool):
         super().__init__()
-        self.up = nn.ConvTranspose3d(in_ch, out_ch, kernel_size=4, stride=2, padding=1)
+        self.up = nn.ConvTranspose3d(in_ch, out_ch, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1))
         self.res1 = ResBlock3D(out_ch + skip_ch, out_ch, time_dim)
         self.res2 = ResBlock3D(out_ch, out_ch, time_dim)
+        self.attn = SelfAttention3D(out_ch) if with_attn else nn.Identity()
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        # x shape: [B, C_in, D, H, W]
-        # skip shape: [B, C_skip, 2D, 2H, 2W]
+    def forward(self, x, skip, t_emb):
         x = self.up(x)
-        # x shape: [B, C_out, 2D, 2H, 2W]
-        if x.shape[-3:] != skip.shape[-3:]:
-            x = F.interpolate(x, size=skip.shape[-3:], mode="trilinear", align_corners=False)
-            # x shape: [B, C_out, D_skip, H_skip, W_skip]
         x = torch.cat([x, skip], dim=1)
-        # x shape: [B, C_out + C_skip, D_skip, H_skip, W_skip]
         x = self.res1(x, t_emb)
-        # x shape: [B, C_out, D_skip, H_skip, W_skip]
         x = self.res2(x, t_emb)
-        # x shape: [B, C_out, D_skip, H_skip, W_skip]
+        x = self.attn(x)
         return x
 
 
-class UNet3DConditional(nn.Module):
-    def __init__(self, in_channels: int = 2, out_channels: int = 1, base_dim: int = 32, depth_levels: int = 3, max_depth: int = 128):
+class ConditionalUNet3D(nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 4,
+        out_channels: int = 8,
+        k_slices: int = 5,
+        base_dim: int = 64,
+        levels: int = 4,
+        groupnorm_groups: int = 8,
+        context_dim: int = 256,
+        use_checkpoint: bool = True,
+    ):
         super().__init__()
-        if depth_levels != 3:
-            raise ValueError("depth_levels must be 3")
-        self.base_dim = base_dim
-        self.depth_levels = depth_levels
+        if levels != 4:
+            raise ValueError("levels must be 4 for channel multipliers (1,2,4,8)")
+
+        self.use_checkpoint = use_checkpoint
+        self.in_channels = in_channels
+        self.model_out_channels = out_channels
 
         time_dim = base_dim * 4
+        chs = [base_dim, base_dim * 2, base_dim * 4, base_dim * 8]
+
+        self.time_emb = SinusoidalTimeEmbedding(base_dim)
         self.time_mlp = nn.Sequential(
-            SinusoidalTimeEmbedding(base_dim),
             nn.Linear(base_dim, time_dim),
             nn.SiLU(),
             nn.Linear(time_dim, time_dim),
         )
 
-        self.depth_embed = nn.Embedding(max_depth, base_dim)
+        self.cond_encoder = CondEncoder2DTokens(k_slices, token_dim=context_dim)
 
-        self.in_conv = nn.Conv3d(in_channels, base_dim, kernel_size=3, padding=1)
+        self.in_conv = WSConv3d(in_channels, chs[0], kernel_size=3, padding=1)
 
-        self.down1 = DownBlock3D(base_dim, base_dim * 2, time_dim)
-        self.down2 = DownBlock3D(base_dim * 2, base_dim * 4, time_dim)
-        self.down3 = DownBlock3D(base_dim * 4, base_dim * 8, time_dim)
+        self.down1 = DownStage(chs[0], chs[0], time_dim, with_attn=False)   # 128->64
+        self.down2 = DownStage(chs[0], chs[1], time_dim, with_attn=False)   # 64->32
+        self.down3 = DownStage(chs[1], chs[2], time_dim, with_attn=True)    # 32->16
+        self.down4 = DownStage(chs[2], chs[3], time_dim, with_attn=True)    # 16->8
 
-        self.mid1 = ResBlock3D(base_dim * 8, base_dim * 8, time_dim)
-        self.mid2 = ResBlock3D(base_dim * 8, base_dim * 8, time_dim)
+        self.mid_res1 = ResBlock3D(chs[3], chs[3], time_dim, groups=groupnorm_groups)
+        self.mid_self = SelfAttention3D(chs[3])
+        self.mid_cross = CrossAttention3D(chs[3], context_dim)
+        self.mid_res2 = ResBlock3D(chs[3], chs[3], time_dim, groups=groupnorm_groups)
 
-        self.up3 = UpBlock3D(base_dim * 8, base_dim * 8, base_dim * 4, time_dim)
-        self.up2 = UpBlock3D(base_dim * 4, base_dim * 4, base_dim * 2, time_dim)
-        self.up1 = UpBlock3D(base_dim * 2, base_dim * 2, base_dim, time_dim)
+        self.up4 = UpStage(chs[3], chs[3], chs[2], time_dim, with_attn=True)   # 8->16
+        self.up3 = UpStage(chs[2], chs[2], chs[1], time_dim, with_attn=True)   # 16->32
+        self.up2 = UpStage(chs[1], chs[1], chs[0], time_dim, with_attn=False)  # 32->64
+        self.up1 = UpStage(chs[0], chs[0], chs[0], time_dim, with_attn=False)  # 64->128
 
-        self.out_block = ResBlock3D(base_dim, base_dim, time_dim)
-        self.out_conv = nn.Conv3d(base_dim, out_channels, kernel_size=1)
+        self.out_norm = nn.GroupNorm(groupnorm_groups, chs[0])
+        self.out_act = nn.SiLU()
+        self.out_conv = WSConv3d(chs[0], out_channels, kernel_size=3, padding=1)
+
+    def _ckpt(self, fn, *args):
+        if self.use_checkpoint and self.training:
+            return checkpoint(fn, *args, use_reentrant=False)
+        return fn(*args)
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond2d: torch.Tensor) -> torch.Tensor:
-        # x_t shape: [B, 1, D, H, W]
-        # t shape: [B]
-        # cond2d shape: [B, 1, H, W]
-        b, _, d, h, w = x_t.shape
+        # x_t: [B, C, D, H, W]
+        # t: [B]
+        # cond2d: [B, K, H, W]
+        t_emb = self.time_mlp(self.time_emb(t))
+        context = self.cond_encoder(cond2d)
 
-        cond3d = cond2d.unsqueeze(2).repeat(1, 1, d, 1, 1)
-        # cond3d shape: [B, 1, D, H, W]
+        x = self.in_conv(x_t)
+        x, s1 = self._ckpt(self.down1, x, t_emb)
+        x, s2 = self._ckpt(self.down2, x, t_emb)
+        x, s3 = self._ckpt(self.down3, x, t_emb)
+        x, s4 = self._ckpt(self.down4, x, t_emb)
 
-        x = torch.cat([x_t, cond3d], dim=1)
-        # x shape: [B, 2, D, H, W]
+        x = self._ckpt(self.mid_res1, x, t_emb)
+        x = self._ckpt(self.mid_self, x)
+        x = self._ckpt(self.mid_cross, x, context)
+        x = self._ckpt(self.mid_res2, x, t_emb)
 
-        x = self.in_conv(x)
-        # x shape: [B, base_dim, D, H, W]
+        x = self._ckpt(self.up4, x, s4, t_emb)
+        x = self._ckpt(self.up3, x, s3, t_emb)
+        x = self._ckpt(self.up2, x, s2, t_emb)
+        x = self._ckpt(self.up1, x, s1, t_emb)
 
-        depth_ids = torch.arange(d, device=x_t.device)
-        # depth_ids shape: [D]
-        depth_emb = self.depth_embed(depth_ids)
-        # depth_emb shape: [D, base_dim]
-        depth_emb = depth_emb.permute(1, 0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-        # depth_emb shape: [1, base_dim, D, 1, 1]
-        depth_emb = depth_emb.expand(b, -1, -1, h, w)
-        # depth_emb shape: [B, base_dim, D, H, W]
-        x = x + depth_emb
-        # x shape: [B, base_dim, D, H, W]
-
-        t_emb = self.time_mlp(t)
-        # t_emb shape: [B, base_dim*4]
-
-        x, s1 = self.down1(x, t_emb)
-        # x shape: [B, base_dim*2, D/2, H/2, W/2]
-        # s1 shape: [B, base_dim*2, D, H, W]
-        x, s2 = self.down2(x, t_emb)
-        # x shape: [B, base_dim*4, D/4, H/4, W/4]
-        # s2 shape: [B, base_dim*4, D/2, H/2, W/2]
-        x, s3 = self.down3(x, t_emb)
-        # x shape: [B, base_dim*8, D/8, H/8, W/8]
-        # s3 shape: [B, base_dim*8, D/4, H/4, W/4]
-
-        x = self.mid1(x, t_emb)
-        # x shape: [B, base_dim*8, D/8, H/8, W/8]
-        x = self.mid2(x, t_emb)
-        # x shape: [B, base_dim*8, D/8, H/8, W/8]
-
-        x = self.up3(x, s3, t_emb)
-        # x shape: [B, base_dim*4, D/4, H/4, W/4]
-        x = self.up2(x, s2, t_emb)
-        # x shape: [B, base_dim*2, D/2, H/2, W/2]
-        x = self.up1(x, s1, t_emb)
-        # x shape: [B, base_dim, D, H, W]
-
-        x = self.out_block(x, t_emb)
-        # x shape: [B, base_dim, D, H, W]
-        x = self.out_conv(x)
-        # x shape: [B, 1, D, H, W]
-        return x
-
-
-if __name__ == "__main__":
-    model = UNet3DConditional()
-    x_t = torch.randn(1, 1, 128, 128, 128)
-    t = torch.randint(0, 1000, (1,))
-    cond2d = torch.randn(1, 1, 128, 128)
-    y = model(x_t, t, cond2d)
-    print(y.shape)
+        out = self.out_conv(self.out_act(self.out_norm(x)))
+        # out: [B, 2*C, D, H, W] (pred + variance)
+        return out
