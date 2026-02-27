@@ -113,4 +113,4 @@ class BraTSDataset(Dataset):
         # cond2d shape: [K, H, W]
         target3d = torch.from_numpy(target3d_np).float()
         # target3d shape: [1, D, H, W]
-        return cond2d, target3d
+        return cond2d, target3d, torch.tensor(indices, dtype=torch.long)
